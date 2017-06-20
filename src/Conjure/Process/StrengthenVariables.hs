@@ -13,15 +13,15 @@ module Conjure.Process.StrengthenVariables
   ) where
 
 import Control.Monad.Writer ( Writer, execWriter )
-import Data.List ( union )
+import Data.List ( delete, union )
 
 import Conjure.Prelude
 import Conjure.Language
--- The following two imports are required together
-import Conjure.Language.Expression.DomainSizeOf ()
-import Conjure.Language.DomainSizeOf ( domainSizeOf )
 import Conjure.Language.NameResolution ( resolveNames )
 import Conjure.Compute.DomainOf ( domainOf )
+-- Needed for domainSizeOf
+import Conjure.Language.Expression.DomainSizeOf ()
+import Conjure.Language.DomainSizeOf ( domainSizeOf )
 
 -- | Strengthen the variables in a model using type- and domain-inference.
 strengthenVariables :: (MonadFail m, MonadLog m, MonadUserError m)
@@ -326,9 +326,14 @@ combineDomains :: (MonadFail m, MonadLog m)
 combineDomains ArithEqual d1 d2 | d1 == d2  = return d1
 -- RangeBounded - combine both bounds
 combineDomains op (DomainInt [RangeBounded lb1 ub1])
-                  (DomainInt [RangeBounded lb2 ub2])
-  = return $ DomainInt [RangeBounded (Op $ mkDomOperLB op (simplifyExpression $ distributeOverMinMax lb1) (simplifyExpression $ distributeOverMinMax ub1) (simplifyExpression $ distributeOverMinMax lb2) (simplifyExpression $ distributeOverMinMax ub2))
-                                     (Op $ mkDomOperUB op (simplifyExpression $ distributeOverMinMax lb1) (simplifyExpression $ distributeOverMinMax ub1) (simplifyExpression $ distributeOverMinMax lb2) (simplifyExpression $ distributeOverMinMax ub2))]
+                  (DomainInt [RangeBounded lb2 ub2]) = do
+                    let lb1' = simplifyExpression $ distributeOverMinMax lb1
+                    let ub1' = simplifyExpression $ distributeOverMinMax ub1
+                    let lb2' = simplifyExpression $ distributeOverMinMax lb2
+                    let ub2' = simplifyExpression $ distributeOverMinMax ub2
+                    let lb = Op $ mkDomOperLB op lb1' ub1' lb2' ub2'
+                    let ub = Op $ mkDomOperUB op lb1' ub1' lb2' ub2'
+                    return $ DomainInt [RangeBounded lb ub]
 -- RangeLowerBounded - combine lower bounds and set upper bound if present
 combineDomains op (DomainInt [RangeBounded lb1 ub])
                   (DomainInt [RangeLowerBounded lb2])
@@ -354,8 +359,11 @@ combineDomains _ d1 (DomainInt [RangeOpen]) = return d1
 combineDomains _ (DomainInt [RangeOpen]) d2 = return d2
 -- RangeSingle - combine with bounds
 combineDomains op (DomainInt [RangeSingle x])
-                  (DomainInt [RangeBounded lb ub])
-  = return $ DomainInt [RangeBounded (Op $ mkDomOperLB op x x (simplifyExpression $ distributeOverMinMax lb) (simplifyExpression $ distributeOverMinMax ub)) (Op $ mkDomOperUB op x x (simplifyExpression $ distributeOverMinMax lb) (simplifyExpression $ distributeOverMinMax ub))]
+                  (DomainInt [RangeBounded lb ub]) = do
+                    let lb' = simplifyExpression $ distributeOverMinMax lb
+                    let ub' = simplifyExpression $ distributeOverMinMax ub
+                    return $ DomainInt [RangeBounded (Op $ mkDomOperLB op x x lb' ub')
+                                                     (Op $ mkDomOperUB op x x lb' ub')]
 combineDomains op (DomainInt [RangeSingle x])
                   (DomainInt [RangeLowerBounded lb])
   = return $ DomainInt [RangeBounded (Op $ mkDomOperLB op x x lb (exprIdentity op)) x]
@@ -363,8 +371,11 @@ combineDomains op (DomainInt [RangeSingle x])
                   (DomainInt [RangeUpperBounded ub])
   = return $ DomainInt [RangeBounded x (Op $ mkDomOperUB op x x (exprIdentity op) ub)]
 combineDomains op (DomainInt [RangeBounded lb ub])
-                  (DomainInt [RangeSingle x])
-  = return $ DomainInt [RangeBounded (Op $ mkDomOperLB op (simplifyExpression $ distributeOverMinMax lb) (simplifyExpression $ distributeOverMinMax ub) x x) (Op $ mkDomOperUB op (simplifyExpression $ distributeOverMinMax lb) (simplifyExpression $ distributeOverMinMax ub) x x)]
+                  (DomainInt [RangeSingle x]) = do
+                    let lb' = simplifyExpression $ distributeOverMinMax lb
+                    let ub' = simplifyExpression $ distributeOverMinMax ub
+                    return $ DomainInt [RangeBounded (Op $ mkDomOperLB op lb' ub' x x)
+                                                     (Op $ mkDomOperUB op lb' ub' x x)]
 combineDomains op (DomainInt [RangeLowerBounded lb])
                   (DomainInt [RangeSingle x])
   = return $ DomainInt [RangeBounded (Op $ mkDomOperLB op lb (exprIdentity op) x x) x]
@@ -525,78 +536,61 @@ distributeOverMinMax e = e
 -------------------------------------------------------------------------------------
 -------------------------------------------------------------------------------------
 --------                                                                     --------
---------  THIS IS UTTERLY HORRIBLE, PLEASE FIND SOME OTHER WAY OF DOING IT.  --------
 --------                      EXPRESSION SIMPLIFICATION                      --------
+--------                        (DOES NOT WORK FULLY)                        --------
 --------                                                                     --------
 -------------------------------------------------------------------------------------
 -------------------------------------------------------------------------------------
 -------------------------------------------------------------------------------------
 -------------------------------------------------------------------------------------
 
+-- | Attempt to simplify an expression.
 simplifyExpression :: Expression -> Expression
 simplifyExpression c@Constant{}  = c
 simplifyExpression r@Reference{} = r
--- sum
--- a + b
-simplifyExpression (Op (MkOpSum (OpSum (AbstractLiteral (AbsLitMatrix _ [ Constant (ConstantInt n1), Constant (ConstantInt n2) ])))))
-  = Constant (ConstantInt $ n1 + n2)
--- x + e
-simplifyExpression (Op (MkOpSum (OpSum (AbstractLiteral (AbsLitMatrix _ [ r@Reference{}, e ])))))
-  = r + simplifyExpression e
--- e + x
-simplifyExpression (Op (MkOpSum (OpSum (AbstractLiteral (AbsLitMatrix _ [ e, r@Reference{} ])))))
-  = simplifyExpression e + r
--- e + e + ...
-simplifyExpression (Op (MkOpSum (OpSum (AbstractLiteral (AbsLitMatrix _ ss)))))
-  = let ss' = map simplifyExpression ss
-        isConstant Constant{} = True
-        isConstant _          = False
-        in if all isConstant ss'
-              then sum ss'
-              else Op (MkOpSum (OpSum (fromList ss')))
--- minus
--- a - b
-simplifyExpression (Op (MkOpMinus (OpMinus (Constant (ConstantInt n1)) (Constant (ConstantInt n2)))))
-  = Constant (ConstantInt $ n1 - n2)
--- x - e
-simplifyExpression (Op (MkOpMinus (OpMinus r@Reference{} e)))
-  = r - simplifyExpression e
--- e - x
-simplifyExpression (Op (MkOpMinus (OpMinus e r@Reference{})))
-  = simplifyExpression e - r
--- e - e
-simplifyExpression (Op (MkOpMinus (OpMinus e1 e2)))
-  = simplifyExpression $ simplifyExpression e1 - simplifyExpression e2
 -- product
 -- a * b
 simplifyExpression (Op (MkOpProduct (OpProduct (AbstractLiteral (AbsLitMatrix _ [ Constant (ConstantInt n1), Constant (ConstantInt n2) ])))))
   = Constant (ConstantInt $ n1 * n2)
--- x * e
-simplifyExpression (Op (MkOpProduct (OpProduct (AbstractLiteral (AbsLitMatrix _ [ r@Reference{}, e ])))))
-  = r * simplifyExpression e
--- e * x
-simplifyExpression (Op (MkOpProduct (OpProduct (AbstractLiteral (AbsLitMatrix _ [ e, r@Reference{} ])))))
-  = simplifyExpression e * r
 -- e * e * ...
 simplifyExpression (Op (MkOpProduct (OpProduct (AbstractLiteral (AbsLitMatrix _ ss)))))
-  = let ss' = map simplifyExpression ss
-        isConstant Constant{} = True
+  = let isConstant Constant{} = True
         isConstant _          = False
-        in if all isConstant ss'
-              then product ss'
-              else Op (MkOpProduct (OpProduct (fromList ss')))
+        ss' = map simplifyExpression $ filter (/= 1) $ associative ss
+        constants = filter isConstant ss'
+        rest = filter (not . isConstant) ss'
+        in Op $ MkOpProduct $ OpProduct $ fromList $ product constants : rest
+  where associative
+          = foldr (\e ss' -> case e of
+                                  Op (MkOpProduct (OpProduct (AbstractLiteral (AbsLitMatrix _ e'))))
+                                    -> ss' ++ associative e'
+                                  _ -> e : ss')
+            []
 -- divide
 -- a / b
 simplifyExpression (Op (MkOpDiv (OpDiv (Constant (ConstantInt n1)) (Constant (ConstantInt n2)))))
   = Constant (ConstantInt $ n1 `div` n2)
--- x / e
-simplifyExpression (Op (MkOpDiv (OpDiv r@Reference{} e)))
-  = r `div` simplifyExpression e
--- e / x
-simplifyExpression (Op (MkOpDiv (OpDiv e r@Reference{})))
-  = simplifyExpression e `div` r
+-- (a * b * ...) / a
+simplifyExpression (Op (MkOpDiv (OpDiv
+  (Op (MkOpProduct (OpProduct (AbstractLiteral (AbsLitMatrix _ ps)))))
+  d))) | d `elem` ps = let ps' = delete d ps
+                           in if length ps' == 1
+                                 then head ps'
+                                 else Op $ MkOpProduct $ OpProduct $ fromList ps'
 -- e / e
 simplifyExpression (Op (MkOpDiv (OpDiv e1 e2)))
-  = simplifyExpression $ simplifyExpression e1 `div` simplifyExpression e2
+  = let e1' = simplifyExpression e1
+        e2' = simplifyExpression e2
+        isInt (Constant (ConstantInt _)) = True
+        isInt _                          = False
+        in if isInt e1' && isInt e2'
+              then simplifyExpression $ e1' `div` e2'
+              else e1' `div` e2'
+-- min
+simplifyExpression (Op (MkOpMin (OpMin (AbstractLiteral (AbsLitMatrix _ ss)))))
+  = Op $ MkOpMin $ OpMin $ fromList $ map simplifyExpression ss
+-- max
+simplifyExpression (Op (MkOpMax (OpMax (AbstractLiteral (AbsLitMatrix _ ss)))))
+  = Op $ MkOpMax $ OpMax $ fromList $ map simplifyExpression ss
 -- ignore
 simplifyExpression e = e
